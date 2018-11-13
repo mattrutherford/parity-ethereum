@@ -17,31 +17,47 @@
 //! Note that all the structs and functions here are documented in `parity.h`, to avoid
 //! duplicating documentation.
 
+extern crate futures;
+extern crate panic_hook;
+extern crate parity_ethereum;
+extern crate tokio;
+extern crate tokio_current_thread;
+
 #[cfg(feature = "jni")]
 extern crate jni;
-extern crate parity_ethereum;
-extern crate panic_hook;
 
+use std::ffi::CString;
 use std::os::raw::{c_char, c_void, c_int};
-use std::panic;
-use std::ptr;
-use std::slice;
-use std::str;
+use std::{panic, ptr, slice, str, thread};
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::Future;
+use tokio_current_thread::CurrentThread;
 
 #[cfg(feature = "jni")]
 use std::mem;
 #[cfg(feature = "jni")]
 use jni::{JNIEnv, objects::JClass, objects::JString, sys::jlong, sys::jobjectArray};
 
+type Callback = Option<extern "C" fn(*mut c_void, *const c_char, usize)>;
+
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5*60);
+
 #[repr(C)]
 pub struct ParityParams {
 	pub configuration: *mut c_void,
-	pub on_client_restart_cb: Option<extern "C" fn(*mut c_void, *const c_char, usize)>,
+	pub on_client_restart_cb: Callback,
 	pub on_client_restart_cb_custom: *mut c_void,
 }
 
 #[no_mangle]
-pub unsafe extern fn parity_config_from_cli(args: *const *const c_char, args_lens: *const usize, len: usize, output: *mut *mut c_void) -> c_int {
+pub unsafe extern fn parity_config_from_cli(
+	args: *const *const c_char,
+	args_lens: *const usize,
+	len: usize,
+	output: *mut *mut c_void
+) -> c_int {
 	panic::catch_unwind(|| {
 		*output = ptr::null_mut();
 
@@ -123,9 +139,23 @@ pub unsafe extern fn parity_destroy(client: *mut c_void) {
 	});
 }
 
+fn to_cstring(response: Vec<u8>) -> (*mut c_char, usize) {
+	let len = response.len();
+	let cstr = CString::new(response).expect("valid string with no null bytes in the middle; qed").into_raw();
+	(cstr, len)
+}
+
+
 #[no_mangle]
-pub unsafe extern fn parity_rpc(client: *mut c_void, query: *const c_char, len: usize, out_str: *mut c_char, out_len: *mut usize) -> c_int {
+pub unsafe extern fn parity_rpc(
+	client: *mut c_void,
+	query: *const c_char,
+	len: usize,
+	callback: Callback,
+) -> c_int {
+
 	panic::catch_unwind(|| {
+
 		let client: &mut parity_ethereum::RunningClient = &mut *(client as *mut parity_ethereum::RunningClient);
 
 		let query_str = {
@@ -136,31 +166,49 @@ pub unsafe extern fn parity_rpc(client: *mut c_void, query: *const c_char, len: 
 			}
 		};
 
-		if let Some(output) = client.rpc_query_sync(query_str) {
-			let q_out_len = output.as_bytes().len();
-			if *out_len < q_out_len {
-				return 1;
-			}
+		let callback = match callback {
+			Some(callback) => Arc::new(callback),
+			None => return 1,
+		};
 
-			ptr::copy_nonoverlapping(output.as_bytes().as_ptr(), out_str as *mut u8, q_out_len);
-			*out_len = q_out_len;
-			0
-		} else {
-			1
-		}
+		let cb = callback.clone();
+
+		// FIXME: provide session object here, if we want to support the PubSub
+		// [niklasad1]: I don't see the benefit with pubsub when we still have to wait for the future!
+		let future = client.rpc_query(query_str, None).map(move |response| {
+			let (cstring, len) = match response {
+				Some(response) => to_cstring(response.into()),
+				_ => to_cstring("empty response".into()),
+			};
+			cb(ptr::null_mut(), cstring, len);
+			()
+		});
+
+		let _handle = thread::Builder::new()
+			.name("rpc-subscriber".into())
+			.spawn(move || {
+				let mut current_thread = CurrentThread::new();
+				current_thread.spawn(future);
+				let _ = current_thread.run_timeout(QUERY_TIMEOUT).map_err(|_e| {
+					let (cstring, len) = to_cstring("timeout".into());
+					callback(ptr::null_mut(), cstring, len);
+				});
+			})
+			.expect("rpc-subscriber thread shouldn't fail; qed");
+		0
 	}).unwrap_or(1)
 }
 
 #[no_mangle]
-pub unsafe extern fn parity_set_panic_hook(callback: extern "C" fn(*mut c_void, *const c_char, usize), param: *mut c_void) {
-	let cb = CallbackStr(Some(callback), param);
+pub unsafe extern fn parity_set_panic_hook(callback: Callback, param: *mut c_void) {
+	let cb = CallbackStr(callback, param);
 	panic_hook::set_with(move |panic_msg| {
 		cb.call(panic_msg);
 	});
 }
 
 // Internal structure for handling callbacks that get passed a string.
-struct CallbackStr(Option<extern "C" fn(*mut c_void, *const c_char, usize)>, *mut c_void);
+struct CallbackStr(Callback, *mut c_void);
 unsafe impl Send for CallbackStr {}
 unsafe impl Sync for CallbackStr {}
 impl CallbackStr {
